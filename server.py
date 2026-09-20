@@ -1,5 +1,5 @@
 from __future__ import annotations
-import asyncio, ipaddress, json, socket, sqlite3, ssl, unicodedata
+import asyncio, hashlib, ipaddress, json, socket, sqlite3, ssl, unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
@@ -15,7 +15,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 APP_DIR = Path(__file__).resolve().parent
-app = FastAPI(title="Teyitli Engine", version="0.4.0")
+app = FastAPI(title="Teyitli Engine", version="0.5.0")
 extractor = tldextract.TLDExtract(suffix_list_urls=())
 RATE = defaultdict(deque)
 SUSPICIOUS = {"login","secure","verify","verification","account","wallet","odeme","payment","giris","guvenli","dogrula","destek","update","signin","auth"}
@@ -116,15 +116,21 @@ def tls_snapshot(host: str) -> dict:
     with socket.create_connection((host,443),timeout=4) as sock:
         with ctx.wrap_socket(sock,server_hostname=host) as ss:
             cert=ss.getpeercert()
+            der=ss.getpeercert(binary_form=True)
     exp=ssl.cert_time_to_seconds(cert["notAfter"])
     expires=datetime.fromtimestamp(exp,timezone.utc)
     issuer=dict(x[0] for x in cert.get("issuer",[]))
+    subject=dict(x[0] for x in cert.get("subject",[]))
+    sans=[v.lower().lstrip("*.") for k,v in cert.get("subjectAltName",[]) if k=="DNS"][:100]
     return {
         "valid": True,
         "issuer": issuer.get("organizationName") or issuer.get("commonName"),
+        "subject_cn": subject.get("commonName"),
+        "sans": sans,
+        "fingerprint_sha256": hashlib.sha256(der).hexdigest() if der else None,
         "expires_at": expires.isoformat(),
         "days_remaining": int((expires-datetime.now(timezone.utc)).total_seconds()/86400),
-        "san_count": len(cert.get("subjectAltName",[]))
+        "san_count": len(sans)
     }
 
 async def rdap_snapshot(domain: str) -> dict:
@@ -141,7 +147,22 @@ async def rdap_snapshot(domain: str) -> dict:
         if created:
             dt=datetime.fromisoformat(created.replace("Z","+00:00"))
             age=max(0,(datetime.now(timezone.utc)-dt).days)
-        return {"available":True,"created_at":created,"age_days":age,"handle":j.get("handle")}
+        entities=[]
+        for ent in j.get("entities",[])[:20]:
+            bits=[]
+            if ent.get("handle"): bits.append(str(ent.get("handle")))
+            vc=ent.get("vcardArray")
+            if isinstance(vc,list) and len(vc)>1:
+                for item in vc[1]:
+                    if isinstance(item,list) and len(item)>=4 and item[0] in ("fn","org"):
+                        val=item[3]
+                        if isinstance(val,list): bits.extend(str(x) for x in val)
+                        else: bits.append(str(val))
+            text=" ".join(x.strip() for x in bits if x and x.strip())
+            if text: entities.append(text[:300])
+        nameservers=[str(x.get("ldhName","")).lower().rstrip(".") for x in j.get("nameservers",[]) if x.get("ldhName")]
+        return {"available":True,"created_at":created,"age_days":age,"handle":j.get("handle"),
+                "entities":entities[:20],"nameservers":nameservers[:20]}
     except Exception:
         return {"available":False}
 
@@ -255,7 +276,7 @@ async def home():
 
 @app.get("/api/health")
 async def health():
-    return {"ok":True,"service":"teyitli-engine","version":"0.4.0"}
+    return {"ok":True,"service":"teyitli-engine","version":"0.5.0"}
 
 @app.get("/radar")
 async def radar_page():
@@ -264,32 +285,39 @@ async def radar_page():
 @app.get("/api/radar/summary")
 async def radar_summary():
     path=APP_DIR/"data"/"radar.db"
-    if not path.exists(): return {"brands":[],"totals":{"findings":0,"high":0}}
+    if not path.exists(): return {"brands":[],"totals":{"findings":0,"actionable":0,"trusted":0,"likely_owned":0}}
     c=sqlite3.connect(path); c.row_factory=sqlite3.Row
     brands=[dict(r) for r in c.execute("""
-      select b.*, 
+      select b.*,
         (select count(*) from findings f where f.brand_id=b.id) findings,
-        (select count(*) from findings f where f.brand_id=b.id and f.risk>=55) high_risk,
-        (select max(risk) from findings f where f.brand_id=b.id) max_risk
+        (select count(*) from findings f where f.brand_id=b.id and f.priority>=60 and f.ownership_state='unknown') actionable,
+        (select count(*) from findings f where f.brand_id=b.id and f.ownership_state='trusted') trusted,
+        (select count(*) from findings f where f.brand_id=b.id and f.ownership_state='likely_owned') likely_owned,
+        (select count(*) from findings f where f.brand_id=b.id and f.ownership_state='unknown') unknown,
+        (select max(priority) from findings f where f.brand_id=b.id) max_priority
       from brands b where enabled=1 order by b.id
     """)]
-    totals=dict(c.execute("select count(*) findings, sum(case when risk>=55 then 1 else 0 end) high from findings").fetchone())
+    totals=dict(c.execute("""select count(*) findings,
+      sum(case when priority>=60 and ownership_state='unknown' then 1 else 0 end) actionable,
+      sum(case when ownership_state='trusted' then 1 else 0 end) trusted,
+      sum(case when ownership_state='likely_owned' then 1 else 0 end) likely_owned
+      from findings""").fetchone())
     c.close(); return {"brands":brands,"totals":totals}
 
 @app.get("/api/radar/findings")
-async def radar_findings(brand_id: int | None=None, limit: int=100):
+async def radar_findings(brand_id: int | None=None, ownership: str | None=None, actionable: bool=False, limit: int=100):
     path=APP_DIR/"data"/"radar.db"
     if not path.exists(): return []
     limit=max(1,min(limit,250))
     c=sqlite3.connect(path); c.row_factory=sqlite3.Row
-    if brand_id:
-        rows=c.execute("""select f.*,b.name brand_name,b.official_domain from findings f
-                          join brands b on b.id=f.brand_id where f.brand_id=?
-                          order by f.risk desc,f.last_seen desc limit ?""",(brand_id,limit)).fetchall()
-    else:
-        rows=c.execute("""select f.*,b.name brand_name,b.official_domain from findings f
-                          join brands b on b.id=f.brand_id
-                          order by f.risk desc,f.last_seen desc limit ?""",(limit,)).fetchall()
+    where=[]; args=[]
+    if brand_id: where.append("f.brand_id=?"); args.append(brand_id)
+    if ownership in ("trusted","likely_owned","unknown"): where.append("f.ownership_state=?"); args.append(ownership)
+    if actionable: where.append("f.priority>=60 and f.ownership_state='unknown'")
+    clause=(" where "+" and ".join(where)) if where else ""
+    rows=c.execute("""select f.*,b.name brand_name,b.official_domain from findings f
+                      join brands b on b.id=f.brand_id"""+clause+
+                   " order by f.priority desc,f.risk desc,f.last_seen desc limit ?",(*args,limit)).fetchall()
     out=[]
     for r in rows:
         x=dict(r)
@@ -299,14 +327,33 @@ async def radar_findings(brand_id: int | None=None, limit: int=100):
     c.close(); return out
 
 @app.get("/api/radar/scans")
-async def radar_scans(limit: int=20):
+async def radar_scans(brand_id: int | None=None, limit: int=20):
     path=APP_DIR/"data"/"radar.db"
     if not path.exists(): return []
     limit=max(1,min(limit,100))
     c=sqlite3.connect(path); c.row_factory=sqlite3.Row
-    rows=[dict(r) for r in c.execute("""select s.*,b.name brand_name from scan_runs s
-                                       join brands b on b.id=s.brand_id
-                                       order by s.id desc limit ?""",(limit,))]
+    if brand_id:
+        rows=[dict(r) for r in c.execute("""select s.*,b.name brand_name from scan_runs s
+                                           join brands b on b.id=s.brand_id where s.brand_id=?
+                                           order by s.id desc limit ?""",(brand_id,limit))]
+    else:
+        rows=[dict(r) for r in c.execute("""select s.*,b.name brand_name from scan_runs s
+                                           join brands b on b.id=s.brand_id
+                                           order by s.id desc limit ?""",(limit,))]
+    c.close(); return rows
+
+@app.get("/api/radar/allowlist")
+async def radar_allowlist(brand_id: int | None=None):
+    path=APP_DIR/"data"/"radar.db"
+    if not path.exists(): return []
+    c=sqlite3.connect(path); c.row_factory=sqlite3.Row
+    if brand_id:
+        rows=[dict(r) for r in c.execute("""select a.*,b.name brand_name from allowlist a
+                                           join brands b on b.id=a.brand_id where a.brand_id=?
+                                           order by a.domain""",(brand_id,))]
+    else:
+        rows=[dict(r) for r in c.execute("""select a.*,b.name brand_name from allowlist a
+                                           join brands b on b.id=a.brand_id order by a.brand_id,a.domain""")]
     c.close(); return rows
 
 
