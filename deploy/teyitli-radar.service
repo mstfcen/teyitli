@@ -1,0 +1,10 @@
+[Unit]
+Description=Teyitli Radar automatic brand scan
+After=network-online.target teyitli.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/mstf/projects/teyitli
+ExecStart=/home/mstf/projects/teyitli/.venv/bin/python /home/mstf/projects/teyitli/radar.py scan-all
+Nice=10

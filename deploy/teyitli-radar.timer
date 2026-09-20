@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Teyitli Radar periodically
+
+[Timer]
+OnActiveSec=2h
+OnUnitActiveSec=3h
+AccuracySec=5m
+RandomizedDelaySec=5m
+
+[Install]
+WantedBy=timers.target

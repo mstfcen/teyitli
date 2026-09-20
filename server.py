@@ -1,5 +1,5 @@
 from __future__ import annotations
-import asyncio, ipaddress, socket, ssl, unicodedata
+import asyncio, ipaddress, json, socket, sqlite3, ssl, unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
@@ -15,7 +15,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 APP_DIR = Path(__file__).resolve().parent
-app = FastAPI(title="Teyitli Engine", version="0.3.0")
+app = FastAPI(title="Teyitli Engine", version="0.4.0")
 extractor = tldextract.TLDExtract(suffix_list_urls=())
 RATE = defaultdict(deque)
 SUSPICIOUS = {"login","secure","verify","verification","account","wallet","odeme","payment","giris","guvenli","dogrula","destek","update","signin","auth"}
@@ -255,7 +255,60 @@ async def home():
 
 @app.get("/api/health")
 async def health():
-    return {"ok":True,"service":"teyitli-engine","version":"0.3.0"}
+    return {"ok":True,"service":"teyitli-engine","version":"0.4.0"}
+
+@app.get("/radar")
+async def radar_page():
+    return FileResponse(APP_DIR/"radar.html")
+
+@app.get("/api/radar/summary")
+async def radar_summary():
+    path=APP_DIR/"data"/"radar.db"
+    if not path.exists(): return {"brands":[],"totals":{"findings":0,"high":0}}
+    c=sqlite3.connect(path); c.row_factory=sqlite3.Row
+    brands=[dict(r) for r in c.execute("""
+      select b.*, 
+        (select count(*) from findings f where f.brand_id=b.id) findings,
+        (select count(*) from findings f where f.brand_id=b.id and f.risk>=55) high_risk,
+        (select max(risk) from findings f where f.brand_id=b.id) max_risk
+      from brands b where enabled=1 order by b.id
+    """)]
+    totals=dict(c.execute("select count(*) findings, sum(case when risk>=55 then 1 else 0 end) high from findings").fetchone())
+    c.close(); return {"brands":brands,"totals":totals}
+
+@app.get("/api/radar/findings")
+async def radar_findings(brand_id: int | None=None, limit: int=100):
+    path=APP_DIR/"data"/"radar.db"
+    if not path.exists(): return []
+    limit=max(1,min(limit,250))
+    c=sqlite3.connect(path); c.row_factory=sqlite3.Row
+    if brand_id:
+        rows=c.execute("""select f.*,b.name brand_name,b.official_domain from findings f
+                          join brands b on b.id=f.brand_id where f.brand_id=?
+                          order by f.risk desc,f.last_seen desc limit ?""",(brand_id,limit)).fetchall()
+    else:
+        rows=c.execute("""select f.*,b.name brand_name,b.official_domain from findings f
+                          join brands b on b.id=f.brand_id
+                          order by f.risk desc,f.last_seen desc limit ?""",(limit,)).fetchall()
+    out=[]
+    for r in rows:
+        x=dict(r)
+        try: x["resolved_ips"]=json.loads(x.get("resolved_ips") or "[]")
+        except Exception: x["resolved_ips"]=[]
+        x.pop("detail_json",None); out.append(x)
+    c.close(); return out
+
+@app.get("/api/radar/scans")
+async def radar_scans(limit: int=20):
+    path=APP_DIR/"data"/"radar.db"
+    if not path.exists(): return []
+    limit=max(1,min(limit,100))
+    c=sqlite3.connect(path); c.row_factory=sqlite3.Row
+    rows=[dict(r) for r in c.execute("""select s.*,b.name brand_name from scan_runs s
+                                       join brands b on b.id=s.brand_id
+                                       order by s.id desc limit ?""",(limit,))]
+    c.close(); return rows
+
 
 @app.post("/api/analyze")
 async def analyze(payload: AnalyzeRequest, request: Request):
