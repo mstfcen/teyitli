@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh Teyitli threat intelligence periodically
+
+[Timer]
+OnBootSec=45m
+OnUnitActiveSec=12h
+AccuracySec=20m
+RandomizedDelaySec=20m
+
+[Install]
+WantedBy=timers.target

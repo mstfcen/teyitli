@@ -84,6 +84,23 @@ def db():
       unique(brand_id,domain,match_type),
       foreign key(brand_id) references brands(id)
     );
+    create table if not exists incidents(
+      id integer primary key autoincrement,
+      brand_id integer not null,
+      finding_id integer not null,
+      domain text not null,
+      state text not null default 'open',
+      severity text not null,
+      priority integer not null,
+      opened_at text not null,
+      updated_at text not null,
+      closed_at text,
+      title text,
+      evidence_json text,
+      unique(brand_id,domain),
+      foreign key(brand_id) references brands(id),
+      foreign key(finding_id) references findings(id)
+    );
     """)
     _ensure_column(c,"findings","priority","integer not null default 0")
     _ensure_column(c,"findings","ownership_state","text not null default 'unknown'")
@@ -231,6 +248,8 @@ def ownership(c,brand,domain,ips,enriched,baseline):
     return "unknown",reason,overlap
 
 def priority_score(raw_risk,ownership_state,enriched):
+    if enriched.get("threat_intel"):
+        return 98
     if ownership_state=="trusted": return 0
     if ownership_state=="likely_owned": return min(25,max(5,round(raw_risk*.22)))
     # Lexical similarity is a discovery signal, not enough by itself for a critical incident.
@@ -306,6 +325,28 @@ def upsert_finding(c,brand,domain,source,raw_risk,ips,enriched,baseline):
     """,(brand["id"],domain,source,raw,priority,action_status(priority),own,reason,1 if overlap else 0,
          now(),now(),json.dumps(ips),web.get("status"),web.get("title"),vis.get("clone_similarity"),
          vis.get("impersonation_score"),rdap.get("age_days"),json.dumps(enriched,ensure_ascii=False)[:60000]))
+    finding_id=c.execute("select id from findings where brand_id=? and domain=?",(brand["id"],domain)).fetchone()[0]
+    incident=c.execute("select * from incidents where brand_id=? and domain=?",(brand["id"],domain)).fetchone()
+    if priority>=60 and (own=="unknown" or enriched.get("threat_intel")):
+        sev="critical" if priority>=80 else "high"
+        evidence={
+            "captured_at":now(),"brand":brand["name"],"official_domain":brand["official_domain"],
+            "domain":domain,"raw_risk":raw,"priority":priority,"ownership_state":own,
+            "ownership_reason":reason,"resolved_ips":ips,"web":web,"rdap":rdap,"tls":enriched.get("tls",{}),
+            "visual":vis
+        }
+        title=f"{brand['name']} lookalike: {domain}"
+        if incident:
+            c.execute("""update incidents set finding_id=?,state='open',severity=?,priority=?,updated_at=?,
+                         closed_at=null,title=?,evidence_json=? where id=?""",
+                      (finding_id,sev,priority,now(),title,json.dumps(evidence,ensure_ascii=False)[:100000],incident["id"]))
+        else:
+            c.execute("""insert into incidents(brand_id,finding_id,domain,state,severity,priority,opened_at,updated_at,title,evidence_json)
+                         values(?,?,?,'open',?,?,?,?,?,?)""",
+                      (brand["id"],finding_id,domain,sev,priority,now(),now(),title,json.dumps(evidence,ensure_ascii=False)[:100000]))
+    elif incident and incident["state"]=="open":
+        c.execute("update incidents set state='closed',updated_at=?,closed_at=?,priority=? where id=?",
+                  (now(),now(),priority,incident["id"]))
 async def scan_brand(brand_id: int):
     c=db(); brand=c.execute("select * from brands where id=?",(brand_id,)).fetchone()
     if not brand or not brand["enabled"]: c.close(); return
@@ -342,9 +383,28 @@ async def scan_brand(brand_id: int):
         for score,domain,ips in live:
             upsert_finding(c,brand,domain,"generated",score,ips,staged.get(domain,{}),baseline)
 
-        actionable=c.execute("select count(*) from findings where brand_id=? and priority>=60 and ownership_state='unknown'",(brand_id,)).fetchone()[0]
-        c.execute("update brands set last_scan_at=?,last_scan_count=? where id=?",(now(),len(live),brand_id))
-        c.execute("update scan_runs set finished_at=?,candidates=?,resolved=?,high_risk=?,ct_names=? where id=?",(now(),len(items),len(live),actionable,len(ct),run_id))
+        # Bring in the newest verified phishing hosts targeting this brand.
+        try:
+            from threat_intel import latest_for_target
+            intel_rows=latest_for_target(brand["name"],10)
+        except Exception:
+            intel_rows=[]
+        if intel_rows:
+            intel_resolved=await resolve_domains([(100,x["host"]) for x in intel_rows])
+            ipmap={dom:ips for _,dom,ips in intel_resolved}
+            for x in intel_rows:
+                host=x["host"]
+                en={"risk":100,"domain":host,"threat_intel":{
+                    "source":x.get("source"),"external_id":x.get("external_id"),
+                    "target":x.get("target"),"verified_at":x.get("verified_at"),"url_hash":x.get("url_hash")
+                }}
+                upsert_finding(c,brand,host,"threat_intel",100,ipmap.get(host,[]),en,baseline)
+
+        actionable=c.execute("""select count(*) from findings where brand_id=? and priority>=60
+                                and (ownership_state='unknown' or source='threat_intel')""",(brand_id,)).fetchone()[0]
+        total_live=len({x[1] for x in live}|{x["host"] for x in intel_rows})
+        c.execute("update brands set last_scan_at=?,last_scan_count=? where id=?",(now(),total_live,brand_id))
+        c.execute("update scan_runs set finished_at=?,candidates=?,resolved=?,high_risk=?,ct_names=? where id=?",(now(),len(items),total_live,actionable,len(ct),run_id))
         c.commit()
         print(json.dumps({"brand":brand["name"],"candidates":len(items),"resolved":len(live),"actionable":actionable,"ct_names":len(ct)},ensure_ascii=False))
     except Exception as e:

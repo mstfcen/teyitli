@@ -1,0 +1,10 @@
+[Unit]
+Description=Teyitli threat-intelligence refresh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/mstf/projects/teyitli
+ExecStart=/home/mstf/projects/teyitli/.venv/bin/python /home/mstf/projects/teyitli/threat_intel.py fetch
+Nice=10

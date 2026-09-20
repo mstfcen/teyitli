@@ -15,11 +15,20 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 APP_DIR = Path(__file__).resolve().parent
-app = FastAPI(title="Teyitli Engine", version="0.5.0")
+app = FastAPI(title="Teyitli Engine", version="0.6.0")
 extractor = tldextract.TLDExtract(suffix_list_urls=())
 RATE = defaultdict(deque)
 SUSPICIOUS = {"login","secure","verify","verification","account","wallet","odeme","payment","giris","guvenli","dogrula","destek","update","signin","auth"}
 SENSITIVE = {"password","passwd","pass","card","kart","cvv","iban","identity","tc","tckn","pin","otp","sms","phone","telefon"}
+BRAND_ALIASES = {
+    "microsoft": ("microsoft","office 365","outlook","onedrive"),
+    "facebook": ("facebook","meta"),
+    "paypal": ("paypal",),
+    "netflix": ("netflix",),
+    "linkedin": ("linkedin",),
+    "apple": ("apple","icloud"),
+    "google": ("google","gmail"),
+}
 CONFUSABLE = str.maketrans({
     "а":"a","е":"e","о":"o","р":"p","с":"c","у":"y","х":"x","і":"i","ј":"j","ѕ":"s",
     "Α":"A","Β":"B","Ε":"E","Ζ":"Z","Η":"H","Ι":"I","Κ":"K","Μ":"M","Ν":"N","Ο":"O","Ρ":"P","Τ":"T","Υ":"Y","Χ":"X",
@@ -188,10 +197,12 @@ async def fetch_snapshot(start_url: str) -> dict:
                 break
     if final is None: final=current
     ctype=headers.get("content-type","").lower()
-    title=None; forms=0; password_fields=0; sensitive_fields=0; external_form_actions=[]
+    title=None; visible_text=""; forms=0; password_fields=0; sensitive_fields=0; external_form_actions=[]
     if "html" in ctype and body:
         soup=BeautifulSoup(body,"html.parser")
         if soup.title: title=soup.title.get_text(" ",strip=True)[:180]
+        for bad in soup(["script","style","noscript","template"]): bad.decompose()
+        visible_text=soup.get_text(" ",strip=True)[:12000]
         fs=soup.find_all("form"); forms=len(fs)
         for form in fs:
             action=form.get("action")
@@ -212,7 +223,7 @@ async def fetch_snapshot(start_url: str) -> dict:
         "x_frame_options": bool(headers.get("x-frame-options")),
         "referrer_policy": bool(headers.get("referrer-policy"))
     }
-    return {"status":status,"final_url":final,"redirects":redirects,"title":title,"content_type":ctype[:100],
+    return {"status":status,"final_url":final,"redirects":redirects,"title":title,"visible_text":visible_text,"content_type":ctype[:100],
             "forms":forms,"password_fields":password_fields,"sensitive_fields":sensitive_fields,
             "external_form_actions":external_form_actions[:5],"security_headers":sec}
 def score_analysis(raw_host:str, ascii_host:str, scheme:str, official:str|None, web:dict, tls:dict, rdap:dict) -> tuple[int,list[dict]]:
@@ -243,6 +254,18 @@ def score_analysis(raw_host:str, ascii_host:str, scheme:str, official:str|None, 
             sig("Homograph iskeleti","danger","Görsel iskelet resmî alan adıyla aynı",32)
     else:
         sig("Referans domain","info","Resmî alan adı verilmedi; marka benzerliği ölçülmedi")
+
+    if official:
+        _,off=host_pair(official)
+        key=skeleton(label(off))
+        aliases=BRAND_ALIASES.get(key,(key,))
+        corpus=((web.get("title") or "")+" "+(web.get("visible_text") or "")).lower()
+        hits=[a for a in aliases if a and a.lower() in corpus]
+        unrelated=registrable(ascii_host)!=registrable(off)
+        if hits and unrelated:
+            pts=28 if web.get("password_fields",0) else 16
+            sig("Sayfa içi marka izi","danger" if pts>=28 else "warn",
+                "İçerikte marka/ürün izi: "+", ".join(hits[:4]),pts)
 
     path=(urlsplit(add_scheme(web.get("final_url") or "")).path or "").lower()
     hits=sorted(x for x in SUSPICIOUS if x in ascii_host or x in path)
@@ -276,7 +299,7 @@ async def home():
 
 @app.get("/api/health")
 async def health():
-    return {"ok":True,"service":"teyitli-engine","version":"0.5.0"}
+    return {"ok":True,"service":"teyitli-engine","version":"0.6.0"}
 
 @app.get("/radar")
 async def radar_page():
@@ -290,7 +313,7 @@ async def radar_summary():
     brands=[dict(r) for r in c.execute("""
       select b.*,
         (select count(*) from findings f where f.brand_id=b.id) findings,
-        (select count(*) from findings f where f.brand_id=b.id and f.priority>=60 and f.ownership_state='unknown') actionable,
+        (select count(*) from findings f where f.brand_id=b.id and f.priority>=60 and (f.ownership_state='unknown' or f.source='threat_intel')) actionable,
         (select count(*) from findings f where f.brand_id=b.id and f.ownership_state='trusted') trusted,
         (select count(*) from findings f where f.brand_id=b.id and f.ownership_state='likely_owned') likely_owned,
         (select count(*) from findings f where f.brand_id=b.id and f.ownership_state='unknown') unknown,
@@ -298,7 +321,7 @@ async def radar_summary():
       from brands b where enabled=1 order by b.id
     """)]
     totals=dict(c.execute("""select count(*) findings,
-      sum(case when priority>=60 and ownership_state='unknown' then 1 else 0 end) actionable,
+      sum(case when priority>=60 and (ownership_state='unknown' or source='threat_intel') then 1 else 0 end) actionable,
       sum(case when ownership_state='trusted' then 1 else 0 end) trusted,
       sum(case when ownership_state='likely_owned' then 1 else 0 end) likely_owned
       from findings""").fetchone())
@@ -313,7 +336,7 @@ async def radar_findings(brand_id: int | None=None, ownership: str | None=None, 
     where=[]; args=[]
     if brand_id: where.append("f.brand_id=?"); args.append(brand_id)
     if ownership in ("trusted","likely_owned","unknown"): where.append("f.ownership_state=?"); args.append(ownership)
-    if actionable: where.append("f.priority>=60 and f.ownership_state='unknown'")
+    if actionable: where.append("f.priority>=60 and (f.ownership_state='unknown' or f.source='threat_intel')")
     clause=(" where "+" and ".join(where)) if where else ""
     rows=c.execute("""select f.*,b.name brand_name,b.official_domain from findings f
                       join brands b on b.id=f.brand_id"""+clause+
@@ -356,6 +379,38 @@ async def radar_allowlist(brand_id: int | None=None):
                                            join brands b on b.id=a.brand_id order by a.brand_id,a.domain""")]
     c.close(); return rows
 
+@app.get("/api/radar/incidents")
+async def radar_incidents(brand_id: int | None=None, state: str | None="open", limit: int=50):
+    path=APP_DIR/"data"/"radar.db"
+    if not path.exists(): return []
+    limit=max(1,min(limit,200))
+    c=sqlite3.connect(path); c.row_factory=sqlite3.Row
+    where=[]; args=[]
+    if brand_id: where.append("i.brand_id=?"); args.append(brand_id)
+    if state in ("open","closed"): where.append("i.state=?"); args.append(state)
+    clause=(" where "+" and ".join(where)) if where else ""
+    rows=c.execute("""select i.id,i.brand_id,i.finding_id,i.domain,i.state,i.severity,i.priority,
+                             i.opened_at,i.updated_at,i.closed_at,i.title,b.name brand_name
+                      from incidents i join brands b on b.id=i.brand_id"""+clause+
+                   " order by case when i.state='open' then 0 else 1 end,i.priority desc,i.updated_at desc limit ?",
+                   (*args,limit)).fetchall()
+    out=[dict(r) for r in rows]; c.close(); return out
+
+@app.get("/api/radar/incidents/{incident_id}")
+async def radar_incident(incident_id: int):
+    path=APP_DIR/"data"/"radar.db"
+    if not path.exists(): raise HTTPException(404,"Incident bulunamadı")
+    c=sqlite3.connect(path); c.row_factory=sqlite3.Row
+    r=c.execute("""select i.*,b.name brand_name,b.official_domain from incidents i
+                   join brands b on b.id=i.brand_id where i.id=?""",(incident_id,)).fetchone()
+    c.close()
+    if not r: raise HTTPException(404,"Incident bulunamadı")
+    x=dict(r)
+    try: x["evidence"]=json.loads(x.pop("evidence_json") or "{}")
+    except Exception: x["evidence"]={}
+    return x
+
+
 
 @app.post("/api/analyze")
 async def analyze(payload: AnalyzeRequest, request: Request):
@@ -389,7 +444,17 @@ async def analyze(payload: AnalyzeRequest, request: Request):
     if isinstance(web_info,Exception): web_info={"status":None,"final_url":add_scheme(payload.url),"redirects":[],"fetch_error":type(web_info).__name__,"forms":0,"password_fields":0,"sensitive_fields":0,"external_form_actions":[],"security_headers":{}}
     if isinstance(visual_info,Exception):
         visual_info={"available":False,"error":type(visual_info).__name__}
+    try:
+        from threat_intel import lookup as threat_lookup
+        threat_info=threat_lookup(payload.url)
+    except Exception:
+        threat_info=None
     score,signals=score_analysis(raw_host,ascii_host,parsed.scheme,payload.official_domain,web_info,tls_info,rdap_info)
+    if threat_info:
+        signals.append({"name":"Threat intelligence","state":"danger",
+                        "detail":f"{threat_info.get('source')} verified phishing · target: {threat_info.get('target') or 'unknown'}",
+                        "points":max(0,98-score)})
+        score=max(score,98)
     if visual_info.get("available") and not visual_info.get("same_registered_domain"):
         imp=float(visual_info.get("impersonation_score",0))
         if imp>=82:
@@ -399,4 +464,4 @@ async def analyze(payload: AnalyzeRequest, request: Request):
             signals.append({"name":"Klon site benzerliği","state":"warn","detail":f"Görsel/DOM/metin benzerliği %{imp:.0f}","points":12})
             score=min(100,score+12)
     level="critical" if score>=70 else "high" if score>=50 else "medium" if score>=25 else "low"
-    return {"input":{"url":payload.url,"official_domain":payload.official_domain},"domain":{"raw":raw_host,"ascii":ascii_host,"registered":registrable(ascii_host),"unicode_label":label(ascii_host),"scripts":scripts(raw_host)},"risk":{"score":score,"level":level,"signals":signals},"dns":dns_info,"tls":tls_info,"rdap":rdap_info,"web":web_info,"visual":visual_info}
+    return {"input":{"url":payload.url,"official_domain":payload.official_domain},"domain":{"raw":raw_host,"ascii":ascii_host,"registered":registrable(ascii_host),"unicode_label":label(ascii_host),"scripts":scripts(raw_host)},"risk":{"score":score,"level":level,"signals":signals},"dns":dns_info,"tls":tls_info,"rdap":rdap_info,"web":web_info,"visual":visual_info,"threat_intel":threat_info}
