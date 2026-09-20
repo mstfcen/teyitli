@@ -6,6 +6,7 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from urllib.parse import urljoin, urlsplit
 
+import aiohttp
 import dns.resolver
 import httpx, idna, tldextract
 from bs4 import BeautifulSoup
@@ -37,6 +38,12 @@ def host_pair(value: str):
     p=urlsplit(add_scheme(value))
     if p.scheme not in ("http","https") or not p.hostname or p.username or p.password:
         raise ValueError("Geçersiz URL")
+    try:
+        port=p.port
+    except ValueError as e:
+        raise ValueError("Geçersiz port") from e
+    if port not in (None,80,443):
+        raise ValueError("Yalnızca 80 ve 443 portları taranır")
     raw=p.hostname.rstrip(".").lower()
     try:
         ascii_host=idna.encode(raw, uts46=True).decode("ascii").lower()
@@ -81,6 +88,16 @@ def ensure_public_host(host: str) -> list[str]:
         if not ip.is_global:
             raise ValueError("Özel/yerel ağ hedefleri taranmaz")
     return ips
+
+class SafeResolver(aiohttp.abc.AbstractResolver):
+    async def resolve(self, host, port=0, family=socket.AF_INET):
+        ips=await asyncio.to_thread(ensure_public_host,host)
+        return [{"hostname":host,"host":ip,"port":port,
+                 "family":socket.AF_INET6 if ":" in ip else socket.AF_INET,
+                 "proto":0,"flags":0} for ip in ips]
+    async def close(self):
+        return None
+
 def dns_snapshot(host: str) -> dict:
     out={"a":[],"aaaa":[],"mx":[],"ns":[]}
     r=dns.resolver.Resolver()
@@ -131,23 +148,21 @@ async def fetch_snapshot(start_url: str) -> dict:
     current=add_scheme(start_url)
     redirects=[]
     final=None; body=b""; headers={}; status=None
-    async with httpx.AsyncClient(timeout=httpx.Timeout(7,connect=4),follow_redirects=False,headers={"User-Agent":"Teyitli-Security-Scanner/0.2"}) as c:
+    timeout=aiohttp.ClientTimeout(total=8,connect=4,sock_read=5)
+    connector=aiohttp.TCPConnector(resolver=SafeResolver(),ttl_dns_cache=0,limit=10)
+    async with aiohttp.ClientSession(timeout=timeout,connector=connector,headers={"User-Agent":"Teyitli-Security-Scanner/0.2"}) as c:
         for _ in range(5):
-            raw,host=host_pair(current)
-            await asyncio.to_thread(ensure_public_host,host)
-            async with c.stream("GET",current) as r:
-                status=r.status_code; headers=dict(r.headers)
+            host_pair(current)
+            async with c.get(current,allow_redirects=False) as r:
+                status=r.status; headers={k.lower():v for k,v in r.headers.items()}
                 if status in (301,302,303,307,308) and r.headers.get("location"):
                     nxt=urljoin(current,r.headers["location"])
+                    host_pair(nxt)
                     redirects.append({"from":current,"to":nxt,"status":status})
                     current=nxt; continue
-                size=0; parts=[]
-                async for chunk in r.aiter_bytes():
-                    if not chunk: continue
-                    take=min(len(chunk),350000-size)
-                    if take>0: parts.append(chunk[:take]); size+=take
-                    if size>=350000: break
-                body=b"".join(parts); final=str(r.url)
+                body=await r.content.read(350001)
+                if len(body)>350000: body=body[:350000]
+                final=str(r.url)
                 break
     if final is None: final=current
     ctype=headers.get("content-type","").lower()
