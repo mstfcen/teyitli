@@ -1,4 +1,7 @@
 aiohttp
+playwright
+pillow
+imagehash
 fastapi
 uvicorn[standard]
 httpx

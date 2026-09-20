@@ -15,7 +15,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 APP_DIR = Path(__file__).resolve().parent
-app = FastAPI(title="Teyitli Engine", version="0.2.0")
+app = FastAPI(title="Teyitli Engine", version="0.3.0")
 extractor = tldextract.TLDExtract(suffix_list_urls=())
 RATE = defaultdict(deque)
 SUSPICIOUS = {"login","secure","verify","verification","account","wallet","odeme","payment","giris","guvenli","dogrula","destek","update","signin","auth"}
@@ -28,7 +28,8 @@ CONFUSABLE = str.maketrans({
 
 class AnalyzeRequest(BaseModel):
     url: str = Field(min_length=3, max_length=2048)
-    official_domain: str | None = Field(default=None, max_length=255)
+    official_domain: str | None = Field(default=None, max_length=2048)
+    include_visual: bool = True
 
 def add_scheme(v: str) -> str:
     v=v.strip()
@@ -254,7 +255,7 @@ async def home():
 
 @app.get("/api/health")
 async def health():
-    return {"ok":True,"service":"teyitli-engine","version":"0.2.0"}
+    return {"ok":True,"service":"teyitli-engine","version":"0.3.0"}
 
 @app.post("/api/analyze")
 async def analyze(payload: AnalyzeRequest, request: Request):
@@ -276,11 +277,26 @@ async def analyze(payload: AnalyzeRequest, request: Request):
     tls_task=asyncio.to_thread(tls_snapshot,ascii_host) if parsed.scheme=="https" else asyncio.sleep(0,result={"valid":False})
     rdap_task=rdap_snapshot(registrable(ascii_host))
     web_task=fetch_snapshot(payload.url)
-    dns_info,tls_info,rdap_info,web_info=await asyncio.gather(dns_task,tls_task,rdap_task,web_task,return_exceptions=True)
+    if payload.official_domain and payload.include_visual:
+        from visual import compare_pages
+        visual_task=compare_pages(add_scheme(payload.official_domain),add_scheme(payload.url))
+    else:
+        visual_task=asyncio.sleep(0,result={"available":False,"reason":"official_reference_required"})
+    dns_info,tls_info,rdap_info,web_info,visual_info=await asyncio.gather(dns_task,tls_task,rdap_task,web_task,visual_task,return_exceptions=True)
     if isinstance(dns_info,Exception): dns_info={"a":[],"aaaa":[],"mx":[],"ns":[]}
     if isinstance(tls_info,Exception): tls_info={"valid":False,"error":type(tls_info).__name__}
     if isinstance(rdap_info,Exception): rdap_info={"available":False}
     if isinstance(web_info,Exception): web_info={"status":None,"final_url":add_scheme(payload.url),"redirects":[],"fetch_error":type(web_info).__name__,"forms":0,"password_fields":0,"sensitive_fields":0,"external_form_actions":[],"security_headers":{}}
+    if isinstance(visual_info,Exception):
+        visual_info={"available":False,"error":type(visual_info).__name__}
     score,signals=score_analysis(raw_host,ascii_host,parsed.scheme,payload.official_domain,web_info,tls_info,rdap_info)
+    if visual_info.get("available") and not visual_info.get("same_registered_domain"):
+        imp=float(visual_info.get("impersonation_score",0))
+        if imp>=82:
+            signals.append({"name":"Klon site benzerliği","state":"danger","detail":f"Görsel/DOM/metin benzerliği %{imp:.0f}","points":24})
+            score=min(100,score+24)
+        elif imp>=62:
+            signals.append({"name":"Klon site benzerliği","state":"warn","detail":f"Görsel/DOM/metin benzerliği %{imp:.0f}","points":12})
+            score=min(100,score+12)
     level="critical" if score>=70 else "high" if score>=50 else "medium" if score>=25 else "low"
-    return {"input":{"url":payload.url,"official_domain":payload.official_domain},"domain":{"raw":raw_host,"ascii":ascii_host,"registered":registrable(ascii_host),"unicode_label":label(ascii_host),"scripts":scripts(raw_host)},"risk":{"score":score,"level":level,"signals":signals},"dns":dns_info,"tls":tls_info,"rdap":rdap_info,"web":web_info}
+    return {"input":{"url":payload.url,"official_domain":payload.official_domain},"domain":{"raw":raw_host,"ascii":ascii_host,"registered":registrable(ascii_host),"unicode_label":label(ascii_host),"scripts":scripts(raw_host)},"risk":{"score":score,"level":level,"signals":signals},"dns":dns_info,"tls":tls_info,"rdap":rdap_info,"web":web_info,"visual":visual_info}
